@@ -1,0 +1,55 @@
+# =======================================================================
+# Edit this file, app.py, and requirements.txt to build the whole project
+# Nothing else needs to be updated when you reuse this template.
+# =======================================================================
+
+[app]
+# Name of the built executable. No spaces, slashes, or colons --
+# this becomes, for example, MyAppName.exe / MyAppName.app.
+name = "MyAppName"
+
+# Friendly name, used in the release notes and README only.
+display_name = "My App Name"
+
+# The Python file PyInstaller starts from.
+entrypoint = "app.py"
+
+# Python version the runners install.
+python_version = "3.12"
+
+
+[pyinstaller]
+# true  -> one clickable file (slower startup, unpacks to temp each launch)
+# false -> a folder (fast startup, user sees a directory of files)
+onefile = true
+
+# true  -> no console window; required for GUI/dialog apps, and what
+#          produces a real .app bundle on macOS.
+# false -> console app. On macOS double-clicking opens Terminal.
+windowed = true
+
+# Modules PyInstaller's analysis can't find on its own.
+hidden_imports = []
+
+# Modules to leave out. Shrinks the binary. Safe only if nothing imports them.
+exclude_modules = [
+    "PyQt5",
+    "PyQt6",
+    "PySide2",
+    "PySide6",
+    "IPython",
+    "pytest",
+]
+
+# Any other PyInstaller flags, one per entry.
+# Example: "--add-data=data/rates.csv:."
+extra_args = []
+
+
+[build]
+# Which platforms to build. Comment out any you don't need --
+# each macOS job costs 10x its wall time against private-repo minutes.
+targets = ["windows", "macos-apple-silicon", "macos-intel"]
+
+# How long to keep intermediate artifacts (release assets are unaffected).
+artifact_retention_days = 3

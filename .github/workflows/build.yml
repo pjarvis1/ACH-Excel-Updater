@@ -1,0 +1,109 @@
+# Generic PyInstaller build. Everything configurable lives in app.toml --
+# this file should not need editing when you reuse the template.
+
+name: Build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------
+  # Read app.toml once and hand the results to every other job.
+  # ------------------------------------------------------------------
+  config:
+    runs-on: ubuntu-latest
+    outputs:
+      app_name:       ${{ steps.read.outputs.app_name }}
+      display_name:   ${{ steps.read.outputs.display_name }}
+      entrypoint:     ${{ steps.read.outputs.entrypoint }}
+      python_version: ${{ steps.read.outputs.python_version }}
+      pyi_args:       ${{ steps.read.outputs.pyi_args }}
+      windows_target: ${{ steps.read.outputs.windows_target }}
+      macos_target:   ${{ steps.read.outputs.macos_target }}
+      retention_days: ${{ steps.read.outputs.retention_days }}
+      matrix:         ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'   # tomllib needs 3.11+
+
+      - name: Read app.toml
+        id: read
+        run: python scripts/build_config.py
+
+  # ------------------------------------------------------------------
+  # Build one binary per platform listed in build.targets.
+  # ------------------------------------------------------------------
+  build:
+    needs: config
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.config.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ needs.config.outputs.python_version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        # Order: shared args, then this platform's icon flag (may be empty),
+        # then the entrypoint script last.
+        run: pyinstaller ${{ needs.config.outputs.pyi_args }} ${{ matrix.icon_arg }} ${{ needs.config.outputs.entrypoint }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ needs.config.outputs.windows_target }}
+          ZIP: ${{ needs.config.outputs.app_name }}-${{ matrix.label }}.zip
+        run: Compress-Archive -Path "$env:TARGET" -DestinationPath "$env:ZIP"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ needs.config.outputs.macos_target }}
+          ZIP: ${{ needs.config.outputs.app_name }}-${{ matrix.label }}.zip
+        run: |
+          # ditto preserves the executable bit and .app bundle structure.
+          # A plain upload strips permissions and the app won't launch.
+          ditto -c -k --sequesterRsrc --keepParent "$TARGET" "$ZIP"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ needs.config.outputs.app_name }}-${{ matrix.label }}
+          path: ${{ needs.config.outputs.app_name }}-${{ matrix.label }}.zip
+          if-no-files-found: error
+          retention-days: ${{ needs.config.outputs.retention_days }}
+
+  # ------------------------------------------------------------------
+  # On a v* tag only: attach the zips to a public Release.
+  # ------------------------------------------------------------------
+  release:
+    needs: [config, build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.config.outputs.display_name }} ${{ github.ref_name }}
+          files: artifacts/**/*.zip
+          generate_release_notes: true

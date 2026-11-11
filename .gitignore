@@ -1,0 +1,17 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Output
+*.png
+
+# OS
+.DS_Store
+Thumbs.db
