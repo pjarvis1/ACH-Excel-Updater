@@ -19,7 +19,7 @@ from openpyxl.formatting.rule import FormulaRule
 from openpyxl.worksheet.datavalidation import DataValidation
 
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 APP_TITLE = f"ACH Returns Updater v{APP_VERSION}"
 
 CURRENT_SHEET = "Current Returns"
@@ -45,6 +45,15 @@ APP_COLUMNS = [
     "Report Date",
     "Notes",
 ]
+
+# Colors and wording used by BOTH this app and the Excel macro, so the
+# workbook always looks the same no matter which one touched it last.
+GREEN_ROW = "C6EFCE"   # row turns this color when Bank Info Updated is checked AND Date Reprocessed has a date
+RED_FONT = "FF0000"    # a name that appears more than once on a sheet turns this color
+CHECK = "✓"
+UPDATED_LIST = f'"{CHECK},"'   # the check mark plus a blank choice
+UPDATED_ERROR = f"Pick {CHECK} from the dropdown, choose the blank line, or press Delete to clear it."
+DATE_ERROR = "Enter a valid date, for example 11/05/2026."
 
 DATE_FMT = "mm/dd/yyyy"
 TEXT_FMT = "@"
@@ -101,7 +110,7 @@ NAME_LINE_PATTERN = re.compile(
 )
 
 TRACE_PATTERN = re.compile(
-    r"Trace\s+Number\s*:\s*(\d{15})[ \t]+(\d{15})(?!\d)"
+    r"Trace\s+Number\s*:\s*(\d{15})\s+(\d{15})(?!\d)"
 )
 
 BANK_PATTERN = re.compile(
@@ -681,8 +690,11 @@ def maintain_rules(wb):
                 if not (
                     rule.type == "expression"
                     and any(
-                        "COUNTIF(" in formula.upper()
-                        or "✓" in formula
+                        CHECK in formula
+                        or (
+                            "COUNTIF(" in formula.upper()
+                            and f"${name_col}" in formula
+                        )
                         for formula in (rule.formula or [])
                     )
                 )
@@ -702,7 +714,7 @@ def maintain_rules(wb):
         )
 
         completed_formula = (
-            f'AND(${updated_col}{start}="✓",'
+            f'AND(${updated_col}{start}="{CHECK}",'
             f'ISNUMBER(${date_col}{start}),'
             f'${date_col}{start}>0)'
         )
@@ -713,7 +725,8 @@ def maintain_rules(wb):
                 formula=[completed_formula],
                 fill=PatternFill(
                     "solid",
-                    fgColor="C6EFCE",
+                    start_color=GREEN_ROW,
+                    end_color=GREEN_ROW,
                 ),
             ),
         )
@@ -728,7 +741,7 @@ def maintain_rules(wb):
             f"{name_col}{start}:{name_col}{end}",
             FormulaRule(
                 formula=[repeated_name_formula],
-                font=Font(color="9C0006"),
+                font=Font(color=RED_FONT),
             ),
         )
 
@@ -769,21 +782,210 @@ def maintain_rules(wb):
             )
 
             if kind == "list":
-                validation.formula1 = '"✓"'
+                validation.formula1 = UPDATED_LIST
             else:
                 validation.operator = "between"
                 validation.formula1 = "1"
                 validation.formula2 = "2958465"
 
             validation.showErrorMessage = True
+            validation.errorTitle = header
             validation.error = (
-                "Choose the checkmark or enter a valid Excel date."
+                UPDATED_ERROR if kind == "list" else DATE_ERROR
             )
 
             ws.add_data_validation(validation)
             validation.add(
                 f"{column_letter}{start}:{column_letter}{end}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Keep Excel's green "number stored as text" triangles hidden.
+# openpyxl drops that setting whenever it saves, so it is put back here.
+# ---------------------------------------------------------------------------
+
+TEXT_NUMBER_COLUMNS = ["EmpID", "Receiving Bank ID", "Receiving Account"]
+
+
+def add_ignored_errors(data, wb):
+    """Return the saved workbook bytes with Excel's 'ignore number stored
+    as text' setting added to both sheets."""
+    import xml.etree.ElementTree as ET
+
+    sheet_ranges = {}
+
+    for sheet_name, table_name in [
+        (CURRENT_SHEET, CURRENT_TABLE),
+        (REPROCESSED_SHEET, REPROCESSED_TABLE),
+    ]:
+        info = get_table_info(wb, sheet_name, table_name, [])
+        last = min(1048576, max(10000, info.r2 + 1000))
+        refs = [
+            f"{get_column_letter(info.cols[name])}{info.r1 + 1}:"
+            f"{get_column_letter(info.cols[name])}{last}"
+            for name in TEXT_NUMBER_COLUMNS
+            if name in info.cols
+        ]
+        if refs:
+            sheet_ranges[sheet_name] = " ".join(refs)
+
+    source = zipfile.ZipFile(io.BytesIO(data))
+
+    ns_main = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    ns_rel = (
+        "{http://schemas.openxmlformats.org/officeDocument/2006/"
+        "relationships}"
+    )
+    ns_pkg = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+    rels = {
+        rel.get("Id"): rel.get("Target")
+        for rel in ET.fromstring(
+            source.read("xl/_rels/workbook.xml.rels")
+        ).iter(f"{ns_pkg}Relationship")
+    }
+
+    targets = {}
+    for sheet in ET.fromstring(source.read("xl/workbook.xml")).iter(
+        f"{ns_main}sheet"
+    ):
+        target = rels.get(sheet.get(f"{ns_rel}id"), "").lstrip("/")
+        targets[sheet.get("name")] = (
+            target if target.startswith("xl/") else "xl/" + target
+        )
+
+    # ignoredErrors has to come before these elements in a worksheet.
+    later = [
+        "<smartTags", "<drawing", "<legacyDrawing", "<legacyDrawingHF",
+        "<drawingHF", "<picture", "<oleObjects", "<controls",
+        "<webPublishItems", "<tableParts", "<extLst", "</worksheet>",
+    ]
+
+    changed = {}
+
+    for sheet_name, refs in sheet_ranges.items():
+        part = targets.get(sheet_name)
+
+        if part is None or part not in source.namelist():
+            continue
+
+        xml = source.read(part).decode("utf-8")
+
+        if "<ignoredErrors" in xml:
+            continue
+
+        position = min(
+            index
+            for index in (xml.find(tag) for tag in later)
+            if index != -1
+        )
+
+        element = (
+            f'<ignoredErrors><ignoredError sqref="{refs}" '
+            'numberStoredAsText="1"/></ignoredErrors>'
+        )
+
+        changed[part] = (
+            xml[:position] + element + xml[position:]
+        ).encode("utf-8")
+
+    if not changed:
+        return data
+
+    output = io.BytesIO()
+
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target_zip:
+        for item in source.infolist():
+            target_zip.writestr(
+                item,
+                changed.get(item.filename, source.read(item.filename)),
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+
+    return output.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Is the workbook open? The app never writes to a workbook that is open, and
+# it never creates copies, temporary files or backups: it asks the person to
+# close the workbook, then tries again.
+# ---------------------------------------------------------------------------
+
+class WorkbookInUseError(PermissionError):
+    """The workbook is open somewhere, so it cannot be updated right now."""
+
+
+def owner_file_candidates(path):
+    """Excel's 'someone has this open' marker files (they start with ~$)."""
+    return [
+        path.with_name("~$" + path.name),
+        path.with_name("~$" + path.name[2:]),
+    ]
+
+
+def read_owner_name(owner_file):
+    """Best-effort: the user name Excel stores inside its marker file."""
+    try:
+        raw = owner_file.read_bytes()
+        name = raw[1:1 + raw[0]].decode("ascii", "ignore").strip()
+        return name if name and name.isprintable() else None
+    except Exception:
+        return None
+
+
+def workbook_in_use(path):
+    """Return a short reason if the workbook is open, otherwise None.
+    This only looks; it never changes anything."""
+    for owner_file in owner_file_candidates(path):
+        if owner_file.exists():
+            who = read_owner_name(owner_file)
+            return (
+                "Excel shows this workbook is open"
+                + (f" (opened by {who})" if who else "")
+                + f". Marker file: {owner_file.name}"
+            )
+
+    try:
+        with path.open("r+b"):
+            pass
+    except PermissionError:
+        return (
+            "This workbook is open in Excel (on this computer or another), "
+            "or you do not have permission to change it"
+        )
+
+    return None
+
+
+def ask_to_close(root, path, reason):
+    """Ask the person to close the workbook. True = try again."""
+    return messagebox.askretrycancel(
+        parent=root,
+        title=APP_TITLE,
+        icon="warning",
+        message=f'Please close "{path.name}" before updating it.',
+        detail=(
+            f"{reason}.\n\n"
+            "Close it in Excel (on this computer and any other), then "
+            "click Retry. Nothing has been changed.\n\n"
+            "If you are sure nobody has it open, a leftover marker file "
+            "whose name starts with ~$ may be sitting in the same folder. "
+            "Delete it, then click Retry."
+        ),
+    )
+
+
+def require_workbook_closed(root, path):
+    """Keep asking until the workbook is closed. False = person canceled."""
+    while True:
+        reason = workbook_in_use(path)
+
+        if reason is None:
+            return True
+
+        if not ask_to_close(root, path, reason):
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +996,7 @@ def save_in_place(wb, path, stat_before, expected_filled_rows):
     """Validate in memory, then save to the selected workbook."""
     buffer = io.BytesIO()
     wb.save(buffer)
-    data = buffer.getvalue()
+    data = add_ignored_errors(buffer.getvalue(), wb)
 
     check = load_workbook(
         io.BytesIO(data),
@@ -834,6 +1036,12 @@ def save_in_place(wb, path, stat_before, expected_filled_rows):
     finally:
         check.close()
 
+    # Never touch a workbook that is open.
+    reason = workbook_in_use(path)
+
+    if reason is not None:
+        raise WorkbookInUseError(reason)
+
     original = path.read_bytes()
     current = path.stat()
 
@@ -845,8 +1053,9 @@ def save_in_place(wb, path, stat_before, expected_filled_rows):
         stat_before.st_size,
     ):
         raise RuntimeError(
-            "Workbook changed during import. "
-            "Original was not changed by this app."
+            "The workbook was changed (for example, saved in Excel) while "
+            "the app was working, so nothing was saved. "
+            "Run the app again."
         )
 
     # Verify that the embedded VBA project remains intact.
@@ -871,10 +1080,9 @@ def save_in_place(wb, path, stat_before, expected_filled_rows):
     try:
         stream = path.open("r+b")
     except PermissionError as exc:
-        raise PermissionError(
-            "Close this workbook in Excel and try again. "
-            "If it is already closed, check your write permissions. "
-            "Nothing was changed and no backup was created."
+        raise WorkbookInUseError(
+            "This workbook is open in Excel (on this computer or another), "
+            "or you do not have permission to change it"
         ) from exc
 
     with stream:
@@ -982,26 +1190,10 @@ def run(root):
 
     excel_path = Path(selected_excel)
 
-    # Check Excel's owner file before loading or editing.
-    owner_file = excel_path.with_name(
-        "~$" + excel_path.name
-    )
-
-    if owner_file.exists():
-        raise PermissionError(
-            "Excel reports this workbook is in use. "
-            "Close it and try again."
-        )
-
-    # Test write access without writing anything.
-    try:
-        with excel_path.open("r+b"):
-            pass
-    except PermissionError as exc:
-        raise PermissionError(
-            "Close the workbook in Excel and try again. "
-            "If already closed, check write permissions."
-        ) from exc
+    # The workbook must be closed before the app touches it.
+    if not require_workbook_closed(root, excel_path):
+        print("Canceled. Nothing was changed.")
+        return
 
     stat_before = excel_path.stat()
     wb, load_notes = load_workbook_checked(excel_path)
@@ -1132,13 +1324,22 @@ def run(root):
 
         maintain_rules(wb)
 
-        # 6. Validate and save without creating backup files.
-        save_in_place(
-            wb,
-            excel_path,
-            stat_before,
-            filled_before + len(records),
-        )
+        # 6. Validate and save. No copies, temporary files or backups are
+        #    created. If the workbook was opened in the meantime, ask the
+        #    person to close it and try the save again.
+        while True:
+            try:
+                save_in_place(
+                    wb,
+                    excel_path,
+                    stat_before,
+                    filled_before + len(records),
+                )
+                break
+            except WorkbookInUseError as in_use:
+                if not ask_to_close(root, excel_path, str(in_use)):
+                    print("Canceled. Nothing was changed.")
+                    return
 
     finally:
         wb.close()
